@@ -2065,9 +2065,13 @@ func (s *knowledgeService) indexFAQChunks(ctx context.Context,
 		}
 	}
 
-	// 删除旧向量
+	// 删除旧向量。先探活 embedding 服务：离线时 BatchIndex 必然失败，
+	// 先删会把尚可检索的旧索引清空；探针失败直接返回，旧索引保持可检索。
 	var deleteDuration time.Duration
 	if needDelete {
+		if _, err := embeddingModel.Embed(ctx, "hello"); err != nil {
+			return fmt.Errorf("embedding service unavailable, keeping existing index: %w", err)
+		}
 		deleteStartTime := time.Now()
 		if err := retrieveEngine.DeleteByChunkIDList(ctx, chunkIDs, embeddingModel.GetDimensions(), types.KnowledgeTypeFAQ); err != nil {
 			logger.Warnf(ctx, "Delete FAQ vectors failed: %v", err)
@@ -2644,8 +2648,8 @@ func (s *knowledgeService) executeFAQMergeOperations(
 		}
 		batch := mergeOps[batchStart:batchEnd]
 
-		// 1. 批量加载完整 chunk（calculateAppendOperations 中只加载了部分字段，
-		//    缺少 status/is_enabled/flags/seq_id 等，直接更新会将这些字段覆盖为零值）
+		// 1. 批量加载完整 chunk（calculateAppendOperations 中只加载了比对所需
+		//    的部分字段，缺少 status/seq_id 等，直接更新会将这些字段覆盖为零值）
 		chunkIDs := make([]string, len(batch))
 		for i, op := range batch {
 			chunkIDs[i] = op.ExistingChunk.ID
@@ -2693,15 +2697,18 @@ func (s *knowledgeService) executeFAQMergeOperations(
 			mergedChunks = append(mergedChunks, fullChunk)
 		}
 
-		// 3. 事务批量保存（GORM Save 全字段更新，确保 metadata/content_hash 持久化）
+		// 3. 先重建索引，成功后再保存。索引失败时 PG 仍保留旧 metadata /
+		// 旧版本号，重试导入仍能看到差异并再次尝试建索引；反过来先存库
+		// 会让重试把该条目判为未变 skip，旧索引却已丢失，再也无法恢复。
+		// 重建索引。先删旧索引：ES v8、Qdrant 等引擎不会覆盖相同 SourceID。
+		if err := s.indexFAQChunks(ctx, kb, faqKnowledge, mergedChunks, embeddingModel, false, true); err != nil {
+			return mergedCount, fmt.Errorf("failed to re-index merged chunks: %w", err)
+		}
+
+		// 4. 事务批量保存（GORM Save 全字段更新，确保 metadata/content_hash 持久化）
 		if err := s.chunkRepo.SaveChunks(ctx, mergedChunks); err != nil {
 			logger.Errorf(ctx, "FAQ import task %s: failed to batch save merged chunks: %v", taskID, err)
 			return mergedCount, fmt.Errorf("failed to batch save merged chunks: %w", err)
-		}
-
-		// 4. 重建索引。先删旧索引：ES v8、Qdrant 等引擎不会覆盖相同 SourceID。
-		if err := s.indexFAQChunks(ctx, kb, faqKnowledge, mergedChunks, embeddingModel, false, true); err != nil {
-			return mergedCount, fmt.Errorf("failed to re-index merged chunks: %w", err)
 		}
 
 		// 5. 收集成功条目信息
